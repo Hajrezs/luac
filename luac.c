@@ -1,449 +1,255 @@
-/*
-** $Id: luac.c,v 1.74 2015/03/12 01:53:53 lhf Exp lhf $
-** Lua compiler (saves bytecodes to files; also lists bytecodes)
-** See Copyright Notice in lua.h
-*/
-
-#define luac_c
-#define LUA_CORE
-
-#include "lprefix.h"
-
-#include <ctype.h>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include "lua.h"
-#include "lauxlib.h"
-
-#include "lobject.h"
-#include "lstate.h"
-#include "lundump.h"
-
-static void PrintFunction(const Proto* f, int full);
-#define luaU_print	PrintFunction
-
-#define PROGNAME	"luac"		/* default program name */
-#define OUTPUT		PROGNAME ".out"	/* default output file */
-
-static int listing=0;			/* list bytecodes? */
-static int dumping=1;			/* dump bytecodes? */
-static int stripping=0;			/* strip debug information? */
-static char Output[]={ OUTPUT };	/* default output file name */
-static const char* output=Output;	/* actual output file name */
-static const char* progname=PROGNAME;	/* actual program name */
-
-static void fatal(const char* message)
-{
- fprintf(stderr,"%s: %s\n",progname,message);
- exit(EXIT_FAILURE);
-}
-
-static void cannot(const char* what)
-{
- fprintf(stderr,"%s: cannot %s %s: %s\n",progname,what,output,strerror(errno));
- exit(EXIT_FAILURE);
-}
-
-static void usage(const char* message)
-{
- if (*message=='-')
-  fprintf(stderr,"%s: unrecognized option '%s'\n",progname,message);
- else
-  fprintf(stderr,"%s: %s\n",progname,message);
- fprintf(stderr,
-  "usage: %s [options] [filenames]\n"
-  "Available options are:\n"
-  "  -l       list (use -l -l for full listing)\n"
-  "  -o name  output to file 'name' (default is \"%s\")\n"
-  "  -p       parse only\n"
-  "  -s       strip debug information\n"
-  "  -v       show version information\n"
-  "  --       stop handling options\n"
-  "  -        stop handling options and process stdin\n"
-  ,progname,Output);
- exit(EXIT_FAILURE);
-}
-
-#define IS(s)	(strcmp(argv[i],s)==0)
-
-static int doargs(int argc, char* argv[])
-{
- int i;
- int version=0;
- if (argv[0]!=NULL && *argv[0]!=0) progname=argv[0];
- for (i=1; i<argc; i++)
- {
-  if (*argv[i]!='-')			/* end of options; keep it */
-   break;
-  else if (IS("--"))			/* end of options; skip it */
-  {
-   ++i;
-   if (version) ++version;
-   break;
-  }
-  else if (IS("-"))			/* end of options; use stdin */
-   break;
-  else if (IS("-l"))			/* list */
-   ++listing;
-  else if (IS("-o"))			/* output file */
-  {
-   output=argv[++i];
-   if (output==NULL || *output==0 || (*output=='-' && output[1]!=0))
-    usage("'-o' needs argument");
-   if (IS("-")) output=NULL;
-  }
-  else if (IS("-p"))			/* parse only */
-   dumping=0;
-  else if (IS("-s"))			/* strip debug information */
-   stripping=1;
-  else if (IS("-v"))			/* show version */
-   ++version;
-  else					/* unknown option */
-   usage(argv[i]);
- }
- if (i==argc && (listing || !dumping))
- {
-  dumping=0;
-  argv[--i]=Output;
- }
- if (version)
- {
-  printf("%s\n",LUA_COPYRIGHT);
-  if (version==argc-1) exit(EXIT_SUCCESS);
- }
- return i;
-}
-
-#define FUNCTION "(function()end)();"
-
-static const char* reader(lua_State *L, void *ud, size_t *size)
-{
- UNUSED(L);
- if ((*(int*)ud)--)
- {
-  *size=sizeof(FUNCTION)-1;
-  return FUNCTION;
- }
- else
- {
-  *size=0;
-  return NULL;
- }
-}
-
-#define toproto(L,i) getproto(L->top+(i))
-
-static const Proto* combine(lua_State* L, int n)
-{
- if (n==1)
-  return toproto(L,-1);
- else
- {
-  Proto* f;
-  int i=n;
-  if (lua_load(L,reader,&i,"=(" PROGNAME ")",NULL)!=LUA_OK) fatal(lua_tostring(L,-1));
-  f=toproto(L,-1);
-  for (i=0; i<n; i++)
-  {
-   f->p[i]=toproto(L,i-n-1);
-   if (f->p[i]->sizeupvalues>0) f->p[i]->upvalues[0].instack=0;
-  }
-  f->sizelineinfo=0;
-  return f;
- }
-}
-
-static int writer(lua_State* L, const void* p, size_t size, void* u)
-{
- UNUSED(L);
- return (fwrite(p,size,1,(FILE*)u)!=1) && (size!=0);
-}
-
-static int pmain(lua_State* L)
-{
- int argc=(int)lua_tointeger(L,1);
- char** argv=(char**)lua_touserdata(L,2);
- const Proto* f;
- int i;
- if (!lua_checkstack(L,argc)) fatal("too many input files");
- for (i=0; i<argc; i++)
- {
-  const char* filename=IS("-") ? NULL : argv[i];
-  if (luaL_loadfile(L,filename)!=LUA_OK) fatal(lua_tostring(L,-1));
- }
- f=combine(L,argc);
- if (listing) luaU_print(f,listing>1);
- if (dumping)
- {
-  FILE* D= (output==NULL) ? stdout : fopen(output,"wb");
-  if (D==NULL) cannot("open");
-  lua_lock(L);
-  luaU_dump(L,f,writer,D,stripping);
-  lua_unlock(L);
-  if (ferror(D)) cannot("write");
-  if (fclose(D)) cannot("close");
- }
- return 0;
-}
-
-int main(int argc, char* argv[])
-{
- lua_State* L;
- int i=doargs(argc,argv);
- argc-=i; argv+=i;
- if (argc<=0) usage("no input files given");
- L=luaL_newstate();
- if (L==NULL) fatal("cannot create state: not enough memory");
- lua_pushcfunction(L,&pmain);
- lua_pushinteger(L,argc);
- lua_pushlightuserdata(L,argv);
- if (lua_pcall(L,2,0,0)!=LUA_OK) fatal(lua_tostring(L,-1));
- lua_close(L);
- return EXIT_SUCCESS;
-}
-
-/*
-** $Id: luac.c,v 1.74 2015/03/12 01:53:53 lhf Exp lhf $
-** print bytecodes
-** See Copyright Notice in lua.h
-*/
-
-#include <ctype.h>
-#include <stdio.h>
-
-#define luac_c
-#define LUA_CORE
-
-#include "ldebug.h"
-#include "lobject.h"
-#include "lopcodes.h"
-
-#define VOID(p)		((const void*)(p))
-
-static void PrintString(const TString* ts)
-{
- const char* s=getstr(ts);
- size_t i,n=tsslen(ts);
- printf("%c",'"');
- for (i=0; i<n; i++)
- {
-  int c=(int)(unsigned char)s[i];
-  switch (c)
-  {
-   case '"':  printf("\\\""); break;
-   case '\\': printf("\\\\"); break;
-   case '\a': printf("\\a"); break;
-   case '\b': printf("\\b"); break;
-   case '\f': printf("\\f"); break;
-   case '\n': printf("\\n"); break;
-   case '\r': printf("\\r"); break;
-   case '\t': printf("\\t"); break;
-   case '\v': printf("\\v"); break;
-   default:	if (isprint(c))
-   			printf("%c",c);
-		else
-			printf("\\%03d",c);
-  }
- }
- printf("%c",'"');
-}
-
-static void PrintConstant(const Proto* f, int i)
-{
- const TValue* o=&f->k[i];
- switch (ttype(o))
- {
-  case LUA_TNIL:
-	printf("nil");
-	break;
-  case LUA_TBOOLEAN:
-	printf(bvalue(o) ? "true" : "false");
-	break;
-  case LUA_TNUMFLT:
-	{
-	char buff[100];
-	sprintf(buff,LUA_NUMBER_FMT,fltvalue(o));
-	printf("%s",buff);
-	if (buff[strspn(buff,"-0123456789")]=='\0') printf(".0");
-	break;
-	}
-  case LUA_TNUMINT:
-	printf(LUA_INTEGER_FMT,ivalue(o));
-	break;
-  case LUA_TSHRSTR: case LUA_TLNGSTR:
-	PrintString(tsvalue(o));
-	break;
-  default:				/* cannot happen */
-	printf("? type=%d",ttype(o));
-	break;
- }
-}
-
-#define UPVALNAME(x) ((f->upvalues[x].name) ? getstr(f->upvalues[x].name) : "-")
-#define MYK(x)		(-1-(x))
-
-static void PrintCode(const Proto* f)
-{
- const Instruction* code=f->code;
- int pc,n=f->sizecode;
- for (pc=0; pc<n; pc++)
- {
-  Instruction i=code[pc];
-  OpCode o=GET_OPCODE(i);
-  int a=GETARG_A(i);
-  int b=GETARG_B(i);
-  int c=GETARG_C(i);
-  int ax=GETARG_Ax(i);
-  int bx=GETARG_Bx(i);
-  int sbx=GETARG_sBx(i);
-  int line=getfuncline(f,pc);
-  printf("\t%d\t",pc+1);
-  if (line>0) printf("[%d]\t",line); else printf("[-]\t");
-  printf("%-9s\t",luaP_opnames[o]);
-  switch (getOpMode(o))
-  {
-   case iABC:
-    printf("%d",a);
-    if (getBMode(o)!=OpArgN) printf(" %d",ISK(b) ? (MYK(INDEXK(b))) : b);
-    if (getCMode(o)!=OpArgN) printf(" %d",ISK(c) ? (MYK(INDEXK(c))) : c);
-    break;
-   case iABx:
-    printf("%d",a);
-    if (getBMode(o)==OpArgK) printf(" %d",MYK(bx));
-    if (getBMode(o)==OpArgU) printf(" %d",bx);
-    break;
-   case iAsBx:
-    printf("%d %d",a,sbx);
-    break;
-   case iAx:
-    printf("%d",MYK(ax));
-    break;
-  }
-  switch (o)
-  {
-   case OP_LOADK:
-    printf("\t; "); PrintConstant(f,bx);
-    break;
-   case OP_GETUPVAL:
-   case OP_SETUPVAL:
-    printf("\t; %s",UPVALNAME(b));
-    break;
-   case OP_GETTABUP:
-    printf("\t; %s",UPVALNAME(b));
-    if (ISK(c)) { printf(" "); PrintConstant(f,INDEXK(c)); }
-    break;
-   case OP_SETTABUP:
-    printf("\t; %s",UPVALNAME(a));
-    if (ISK(b)) { printf(" "); PrintConstant(f,INDEXK(b)); }
-    if (ISK(c)) { printf(" "); PrintConstant(f,INDEXK(c)); }
-    break;
-   case OP_GETTABLE:
-   case OP_SELF:
-    if (ISK(c)) { printf("\t; "); PrintConstant(f,INDEXK(c)); }
-    break;
-   case OP_SETTABLE:
-   case OP_ADD:
-   case OP_SUB:
-   case OP_MUL:
-   case OP_POW:
-   case OP_DIV:
-   case OP_IDIV:
-   case OP_BAND:
-   case OP_BOR:
-   case OP_BXOR:
-   case OP_SHL:
-   case OP_SHR:
-   case OP_EQ:
-   case OP_LT:
-   case OP_LE:
-    if (ISK(b) || ISK(c))
-    {
-     printf("\t; ");
-     if (ISK(b)) PrintConstant(f,INDEXK(b)); else printf("-");
-     printf(" ");
-     if (ISK(c)) PrintConstant(f,INDEXK(c)); else printf("-");
-    }
-    break;
-   case OP_JMP:
-   case OP_FORLOOP:
-   case OP_FORPREP:
-   case OP_TFORLOOP:
-    printf("\t; to %d",sbx+pc+2);
-    break;
-   case OP_CLOSURE:
-    printf("\t; %p",VOID(f->p[bx]));
-    break;
-   case OP_SETLIST:
-    if (c==0) printf("\t; %d",(int)code[++pc]); else printf("\t; %d",c);
-    break;
-   case OP_EXTRAARG:
-    printf("\t; "); PrintConstant(f,ax);
-    break;
-   default:
-    break;
-  }
-  printf("\n");
- }
-}
-
-#define SS(x)	((x==1)?"":"s")
-#define S(x)	(int)(x),SS(x)
-
-static void PrintHeader(const Proto* f)
-{
- const char* s=f->source ? getstr(f->source) : "=?";
- if (*s=='@' || *s=='=')
-  s++;
- else if (*s==LUA_SIGNATURE[0])
-  s="(bstring)";
- else
-  s="(string)";
- printf("\n%s <%s:%d,%d> (%d instruction%s at %p)\n",
- 	(f->linedefined==0)?"main":"function",s,
-	f->linedefined,f->lastlinedefined,
-	S(f->sizecode),VOID(f));
- printf("%d%s param%s, %d slot%s, %d upvalue%s, ",
-	(int)(f->numparams),f->is_vararg?"+":"",SS(f->numparams),
-	S(f->maxstacksize),S(f->sizeupvalues));
- printf("%d local%s, %d constant%s, %d function%s\n",
-	S(f->sizelocvars),S(f->sizek),S(f->sizep));
-}
-
-static void PrintDebug(const Proto* f)
-{
- int i,n;
- n=f->sizek;
- printf("constants (%d) for %p:\n",n,VOID(f));
- for (i=0; i<n; i++)
- {
-  printf("\t%d\t",i+1);
-  PrintConstant(f,i);
-  printf("\n");
- }
- n=f->sizelocvars;
- printf("locals (%d) for %p:\n",n,VOID(f));
- for (i=0; i<n; i++)
- {
-  printf("\t%d\t%s\t%d\t%d\n",
-  i,getstr(f->locvars[i].varname),f->locvars[i].startpc+1,f->locvars[i].endpc+1);
- }
- n=f->sizeupvalues;
- printf("upvalues (%d) for %p:\n",n,VOID(f));
- for (i=0; i<n; i++)
- {
-  printf("\t%d\t%s\t%d\t%d\n",
-  i,UPVALNAME(i),f->upvalues[i].instack,f->upvalues[i].idx);
- }
-}
-
-static void PrintFunction(const Proto* f, int full)
-{
- int i,n=f->sizep;
- PrintHeader(f);
- PrintCode(f);
- if (full) PrintDebug(f);
- for (i=0; i<n; i++) PrintFunction(f->p[i],full);
-}
+LJ����6���B����X��U��6��)��B�X��6��'�-��B�U��6��)��B�X��K���xcrashsampRegisterChatCommand	waitisSampAvailable����-������.���-�����X�6���'�)��B�1�X��6���'�)��B�1�K����<{ffcc0000}[HajrezaXDCrasher]: {ffff00}On-Foot Crasher Now Is ON={ffCC0000}[HajrezaXDCrasher]: {ffff00}On-Foot Crasher Now Is OFFsampAddChatMessageH��-����X�	���X�+�L�-����X�	��X�+�L�K������
+�*-����X�-��.�6��'�B)��=-���X�6�-�B-����X�-��.�-���X�6��'�B)(�=)��=9B6�'	�)�B+�L�K������~r~Player CrasherprintStringNow	send
+keysDataweaponplayersendSpectatorcamModeaimsamp_create_sync_data\��-����X�6��'�B)3�=9BK���	sendcamModeaimsamp_create_sync_data����6���B�6���-��:B6���-�-�9-�B�A6���-�9-�9)�B6���BK���	����raknetDeleteBitStreamUNRELIABLE_SEQUENCEDHIGH_PRIORITYraknetSendBitStreamExsizeofraknetBitStreamWriteBufferraknetBitStreamWriteInt8raknetNewBitStream���-��8L�����-��<K�����4�t6��'�B6��'�B6��'�B��X�+�5�5�99>6�>=	5
+�99>6�>=
+5�99>6�>=5�99>6�>=5�99>6�>=5�99>=5�99>=5 �99!>="8�'#�:&9$	�4
+��B6	%�9
+&''�9$
+�'(�&
+
+�B�A
+�A	���X
+�:
+�
+�X�,��X
+�6
+)�6*�B
+�
+�X
+�6
+%��B
+
+�
+��	�B
+3
++�5-�3,�=.3/�=061�5
+2�=
+3
+�2���D�	send��setmetatable__newindex�__index����PLAYER_PED sampGetPlayerIdByCharHandle*uintptr_t	cast
+tonumbernewstruct spectatorSPECTATOR_SYNC��SpectatorSyncDatabulletBULLET_SYNC��BulletSyncDataunoccupiedUNOCCUPIED_SYNC��UnoccupiedSyncDatatrailersampStorePlayerTrailerDataTRAILER_SYNC��TrailerSyncDataaimsampStorePlayerAimData
+AIM_SYNC��AimSyncDatapassenger!sampStorePlayerPassengerDataPASSENGER_SYNC��PassengerSyncDatavehiclesampStorePlayerIncarDataVEHICLE_SYNC��VehicleSyncDataplayer��sampStorePlayerOnfootDataPLAYER_SYNCPACKET��PlayerSyncDatasamp.raknetsampfuncsffirequire�.����6��'�B6��'�B6��'�B5�5�=5�=5	�=
+5�=5
+�=5�=5�=5�=5�=5�=5�=5�=5�=5�= 5!�="5#�=$5%�=&5'�=(5)�=*5+�=,5-�=.5/�=051�=253�=455�=657�=859�=:5;�=<5=�=>5?�=@5A�=B5C�=D5E�=F5G�=H5I�=J5K�=L5M�=N5O�=P5Q�=R5S�=T5U�=V5W�=X5Y�=Z5[�=\5]�=^5_�=`5a�=b5c�=d5e�=f5g�=h5i�=j5k�=l5m�=n5o�=p5q�=r5s�=t5u�=v5w�=x5y�=z5{�=|5}�=~5�=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��=�5��5��8���X	Y�6	��B	8
+��
+�X
+�
+�
+�
+)��
+�XG�)�
+�)
+�M�88��X�89�	�8BX�89�	�8BO�X
+2���X
+�9
+�	��B
+X
++��8�X
+�9
+�	��B
+X
+$��b�X
+�9
+�	��B
+X
+����X
+�9
+�	��B
+X
+����X
+�9
+�	��B
+X
+����X
+�9
+�	��)
+�B
+X
+����X
+�9
+�	��)
+�B
+6
+���8	�B
+6
+��	�B
+K��raknetDeleteBitStream"raknetEmulRpcReceiveBitStream"on_set_object_material_writer on_vehicle_stream_in_writeron_show_textdraw_writeron_init_menu_writeron_create_object_writeron_init_game_writer
+writeraknetNewBitStream�Int32Array3PlayerScorePingMap�onShowTextDrawonSetObjectMaterialTextonVehicleStreamInonSetObjectMaterialonInitMenuonInitGameonCreateObjectonSetPlayerAttachedObject��
+int16
+int32	bool
+int32
+int32
+vector3d
+vector3d
+vector3d
+int32
+int32qonSetVehicleParamsEx��
+int16	int8	int8	int8	int8	int8	int8	int8	int8	int8	int8	int8	int8	int8	int8	int8	int8onSetObjectMaterialText��TonSetObjectMaterial��TonUpdateScoresAndPings��PlayerScorePingMap�onPlayerEnterVehicle��
+int16
+int16
+bool8onPlayerDeath��
+int16�onVehicleStreamOut��
+int16�onVehicleStreamIn���onPlayerStreamOut��
+int16�onConnectionRejected��	int8�onChatMessage��
+int16string8eonSetVehicleParams��
+int16
+int16
+bool8�onSetVehicleAngle��
+int16
+float�onSetVehiclePosition��
+int16
+vector3d�onSetCameraLookAt��
+vector3d	int8�onSetCameraPosition��
+vector3d�onSetInterior��	int8�onSetPlayerSkin��
+int32
+int32�onSetWeather��	int8�onDetachTrailerFromVehicle��
+int16�onAttachTrailerToVehicle��
+int16
+int16�onSetVehicleHealth��
+int16
+float�onSetGravity��
+float�onSetWeaponAmmo��	int8
+int16�onRemoveMapIcon��	int8�onTextDrawHide��
+int16�onSetPlayerWantedLevel��	int8�onShowTextDraw���onSpectateVehicle��
+int16	int8onSpectatePlayer��
+int16	int8~onTogglePlayerSpectating��bool32|onSetVehicleNumberPlate��
+int16string8{onStopObject��
+int16zonGangZoneFlash��
+int16
+int32yonGangZoneDestroy��
+int16xonPlayCrimeReport��
+int16
+int32
+int32
+int32
+int32
+vector3dponCreateGangZone��
+int16
+vector2d
+vector2d
+int32lonSetCheckpoint��
+vector3d
+floatkonTextDrawSetString��
+int16
+string16ionEnableStuntBonus��	boolhonMoveObject��
+int16
+vector3d
+vector3d
+float
+vector3dconCreatePickup��
+int32
+int32
+int32
+vector3d_onSetWorldTime��	int8^onServerMessage��
+int32
+string32]onSetVehicleVelocity��
+bool8
+vector3d[onSetPlayerVelocity��
+vector3dZonSetPlayerFightingStyle��
+int16	int8YonSetPlayerSpecialAction��	int8XonClearPlayerAnimation��
+int16WonApplyPlayerAnimation
+��
+int16string8string8	bool	bool	bool	bool
+int32VonGangZoneStopFlash��
+int16UonInterpolateCamera��	bool
+vector3d
+vector3d
+int32	int8RonAttachCameraToObject��
+int16QonShowPlayerNameTag��
+int16
+bool8PonCreateExplosion��
+vector3d
+int32
+floatOonHideMenu��	int8NonShowMenu��	int8MonInitMenu��LonAttachObjectToPlayer��
+int16
+int16
+vector3d
+vector3dKonDisplayGameText��
+int32
+int32
+string32IonSetPlayerColor��
+int16
+int32HonPutPlayerInVehicle��
+int16	int8FonSetPlayerTeam��
+int16	int8EonSetSpawnInfo	��	int8
+int32	int8
+vector3d
+floatInt32Array3Int32Array3DonSetPlayerArmedWeapon��
+int32ConSetPlayerArmour��
+floatBonLinkVehicleToInterior��
+int16	int8AonDestroyPickup��
+int32?onShowDialog��
+int16	int8string8string8string8encodedString4096=onUpdateGlobalTimer��
+int32<onPlayerChatBubble��
+int16
+int32
+float
+int32string8;onRemove3DTextLabel��
+int16:onRemoveVehicleComponent��
+int16
+int169onSetMapIcon��	int8
+vector3d	int8
+int32	int88onPlayerDeathNotification��
+int16
+int16	int87onDestroyObject��
+int16/onSetObjectRotation��
+int16
+vector3d.onSetObjectPosition��
+int16
+vector3d-onCreateObject��,onRemoveBuilding��
+int32
+vector3d
+float+onPlayAudioStream��string8
+vector3d
+float
+bool8)onSetRaceCheckpoint��	int8
+vector3d
+vector3d
+float&onCreate3DText
+��
+int16
+int32
+vector3d
+float
+bool8
+int16
+int16encodedString4096$onSetPlayerDrunk��
+int32#onSetPlayerSkillLevel��
+int16
+int32
+int16"onSetShopName��string256!onPlayerStreamIn	��
+int16	int8
+int32
+vector3d
+float
+int32	int8 onSetToggleClock��
+bool8onSetPlayerTime��	int8	int8onGivePlayerWeapon��
+int32
+int32onSetPlayerFacingAngle��
+floatonGivePlayerMoney��
+int32onSetWorldBounds��
+float
+float
+float
+floatonPlaySound��
+int32
+vector3donTogglePlayerControllable��
+bool8onSetPlayerHealth��
+floatonSetPlayerPosFindZ��
+vector3d
+onSetPlayerPos��
+vector3donSetPlayerName��
+int16string8
+bool8onRequestSpawnResponse��
+bool8�onRequestClassResponse
+��
+bool8	int8
+int32	int8
+vector3d
+floatInt32Array3Int32Array3�onPlayerQuit��
+int16	int8�onPlayerJoin��
+int16
+int32
+bool8string8�onInitGame�����samp.events.extra_typessamp.events.handlerssamp.events.bitstream_iorequire����!6���'�B�6��'�B�6��'�B�6��'�B�+�+�+�+�+�+�3�7�3	�3
+�7�3
+�=�3�7�3�7�3�7�2���K��
+emul_rpc�samp_create_sync_data�sendSpectator��onSendPlayerSynconReceiveRpc��	main�lib.samp.eventsmoonloaderrequireMr_XyZzscript_authorPlayer Crasherscript_name�
